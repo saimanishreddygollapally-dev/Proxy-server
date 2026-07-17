@@ -148,7 +148,7 @@ Example
 ## 🎯 Skills Demonstrated
 
 - Socket Programming
-- Computer Networks
+- Computer Network
 - Operating Systems
 - POSIX Threads
 - Concurrent Programming
