@@ -1,162 +1,121 @@
 # 🌐 Multithreaded HTTP Proxy Server
 
-A high-performance multithreaded HTTP proxy server written in **C** using **POSIX sockets** and **pthreads**. The proxy accepts client requests, forwards HTTP GET requests to destination servers, caches frequently accessed responses using an **LRU (Least Recently Used)** cache, and serves cached content to reduce latency and network traffic.
+A multithreaded HTTP proxy server written in **C** using **POSIX sockets** and **pthreads**. The proxy accepts client connections, processes requests through an **8-thread worker pool**, forwards HTTP requests to remote servers, and caches GET responses using a **thread-safe LRU cache**.
 
 ---
 
 ## 🚀 Features
 
-- Multithreaded client handling using POSIX threads
-- HTTP GET request forwarding
-- LRU cache for faster repeated requests
-- Thread-safe cache access
+- Multithreaded client request processing using an **8-thread worker pool**
+- Bounded **producer-consumer queue** for managing client connections
+- HTTP **GET, POST, PUT, and DELETE** request handling
+- HTTP request parsing and forwarding
+- Request-body forwarding for POST and PUT requests
+- Thread-safe **LRU cache** for GET responses
+- **200 MB** maximum cache capacity
+- **10 MB** maximum cache entry size
+- Cache hit and cache miss tracking
+- Thread-safe runtime metrics
+- Request latency and active request tracking
 - Concurrent client support
-- HTTP request parsing
-- Cache hit and cache miss handling
-- Socket programming using Berkeley sockets
-- Modular project structure
+- Stress testing with **500 concurrent requests**
 
 ---
 
 ## 🏗️ Architecture
 
-```
-                 Client
-                    │
-                    ▼
-          Proxy Server (C)
-                    │
-        ┌───────────┴───────────┐
-        │                       │
-   Cache Hit               Cache Miss
-        │                       │
-        ▼                       ▼
- Return Cached Data      Remote Web Server
-        │                       │
-        └───────────┬───────────┘
-                    ▼
-            Store in LRU Cache
-                    │
-                    ▼
-               Send Response
-```
-
----
-
-## 🛠️ Tech Stack
-
-- C
-- POSIX Threads (pthread)
-- Berkeley Socket API
-- HTTP Protocol
-- LRU Cache
-- Linux System Programming
-
----
-
-## 📂 Project Structure
-
 ```text
-Proxy-Server/
-│
-├── proxy_server.c
-├── proxy_parse.c
-├── proxy_parse.h
-├── cache.c
-├── cache.h
-├── Makefile
-├── README.md
-└── images/
-```
-
-*(Adjust the filenames if your project uses different names.)*
-
----
-
-## ⚙️ How It Works
-
-1. Client sends an HTTP GET request to the proxy server.
-2. The proxy parses the incoming request.
-3. The cache is searched for the requested resource.
-4. If the resource exists:
-   - Return the cached response.
-5. Otherwise:
-   - Connect to the destination web server.
-   - Forward the request.
-   - Receive the response.
-   - Store the response in the LRU cache.
-   - Send the response back to the client.
-
----
-
-## 🔄 Cache Management
-
-The proxy implements an **LRU (Least Recently Used)** cache.
-
-- Frequently accessed pages remain in cache.
-- Least recently used entries are evicted when the cache reaches its capacity.
-- Cache lookups reduce response latency and network requests.
-
----
-
-## 🧵 Concurrency
-
-Each incoming client connection is handled by a separate thread.
-
-This allows the proxy to:
-
-- Serve multiple clients simultaneously.
-- Process independent requests concurrently.
-- Protect shared cache data using synchronization primitives.
-
----
-
-## 📦 Installation
-
-Clone the repository
-
-```bash
-git clone https://github.com/your-username/Proxy-Server.git
-```
-
-Navigate to the project
-
-```bash
-cd Proxy-Server
-```
-
+                         Client
+                           │
+                           ▼
+                  ┌─────────────────┐
+                  │   Proxy Server  │
+                  │      (C)        │
+                  └────────┬────────┘
+                           │
+                           ▼
+                  ┌─────────────────┐
+                  │  Bounded Queue  │
+                  │ Producer/Consumer│
+                  └────────┬────────┘
+                           │
+             ┌─────────────┼─────────────┐
+             │             │             │
+             ▼             ▼             ▼
+          Worker 1      Worker 2   ...  Worker 8
+             │             │             │
+             └─────────────┼─────────────┘
+                           │
+                           ▼
+                  ┌─────────────────┐
+                  │    GET Cache    │
+                  │ Thread-Safe LRU │
+                  └────────┬────────┘
+                           │
+                    ┌──────┴──────┐
+                    │             │
+                 Cache Hit     Cache Miss
+                    │             │
+                    │             ▼
+                    │    ┌─────────────────┐
+                    │    │ Remote Server   │
+                    │    └────────┬────────┘
+                    │             │
+                    │             ▼
+                    │      Store Response
+                    │       in LRU Cache
+                    │             │
+                    └──────┬──────┘
+                           ▼
+                    Send Response
+                      to Client
+git clone https://github.com/saimanishreddygollapally-dev/Proxy-server.git
+Navigate to the Project
+cd Proxy-server
 Compile
-
-```bash
-make
-```
-
+gcc proxy_server.c proxy_parse.c -o proxy_server -lpthread
 Run
+./proxy_server
 
-```bash
-./proxy_server <port_number>
-```
+The proxy listens on:
 
-Example
+localhost:8080
+🧠 Key Concepts Demonstrated
+Socket Programming
+TCP/IP Networking
+HTTP Protocol
+Client-Server Architecture
+Multithreading
+POSIX Threads
+Thread Pools
+Producer-Consumer Pattern
+Bounded Queues
+Mutex Synchronization
+Condition Variables
+Thread-Safe Data Structures
+LRU Cache Design
+Memory Management
+Runtime Metrics
+Concurrent Load Testing
+🎯 Project Highlights
+8-thread fixed worker pool
+1024-entry bounded connection queue
+200 MB total cache capacity
+10 MB maximum cache entry
+HTTP GET, POST, PUT, DELETE support
+Thread-safe LRU caching
+Thread-safe runtime metrics
+500 concurrent request stress test
+0 proxy errors during the stress test
+📌 Future Improvements
 
-```bash
-./proxy_server 8080
-```
+Possible extensions include:
 
----
-
-## 🎯 Skills Demonstrated
-
-- Socket Programming
-- Computer Networks
-- Operating Systems
-- POSIX Threads
-- Concurrent Programming
-- Synchronization
-- HTTP Protocol
-- Cache Design
-- System Programming
-- Memory Management
-- Linux Development
-
----
+Efficient O(1) cache lookup using a hash table
+Doubly linked list based LRU implementation
+Improved HTTP request-body framing
+Robust handling of partial socket sends
+HTTP persistent connection support
+More detailed latency percentiles
+Cache eviction statistics
+HTTPS proxy support
