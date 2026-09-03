@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <time.h>
+#include <signal.h>
 
 #define MAX_BYTES 4096    //max allowed size of request/response
 #define MAX_SIZE 200*(1<<20)     //size of the cache
@@ -40,7 +41,76 @@ int proxy_socketId;					// socket descriptor of proxy server         //array to 
                                     //waiting threads to sleep and wakes them when traffic on queue decreases
 //sem_t cache_lock;			       
 pthread_mutex_t lock;               //lock is used for locking the cache
+pthread_mutex_t metrics_lock;       //lock is used for locking the metrics counters
 
+long total_requests = 0;
+long get_requests = 0;
+long post_requests = 0;
+long put_requests = 0;
+long delete_requests = 0;
+long cache_hits = 0;
+long cache_misses = 0;
+long errors = 0;
+long active_requests = 0;
+long completed_requests = 0;
+double total_processing_ms = 0.0;
+
+void metrics_inc(long *counter)
+{
+	pthread_mutex_lock(&metrics_lock);
+	(*counter)++;
+	pthread_mutex_unlock(&metrics_lock);
+}
+
+void print_metrics()
+{
+	long t, g, p, u, d, hits, misses, err, active, completed;
+	double total_ms, hit_rate, avg;
+
+	pthread_mutex_lock(&metrics_lock);
+	t = total_requests;
+	g = get_requests;
+	p = post_requests;
+	u = put_requests;
+	d = delete_requests;
+	hits = cache_hits;
+	misses = cache_misses;
+	err = errors;
+	active = active_requests;
+	completed = completed_requests;
+	total_ms = total_processing_ms;
+	pthread_mutex_unlock(&metrics_lock);
+
+	hit_rate = 0.0;
+	if(hits + misses > 0)
+		hit_rate = (100.0 * hits) / (hits + misses);
+
+	avg = 0.0;
+	if(completed > 0)
+		avg = total_ms / completed;
+
+	printf("========== Proxy Metrics ==========\n");
+	printf("Total Requests: %ld\n", t);
+	printf("GET Requests: %ld\n", g);
+	printf("POST Requests: %ld\n", p);
+	printf("PUT Requests: %ld\n", u);
+	printf("DELETE Requests: %ld\n", d);
+	printf("Cache Hits: %ld\n", hits);
+	printf("Cache Misses: %ld\n", misses);
+	printf("Cache Hit Rate: %.2f%%\n", hit_rate);
+	printf("Errors: %ld\n", err);
+	printf("Active Requests: %ld\n", active);
+	printf("Average Latency: %.2f ms\n", avg);
+	printf("===================================\n");
+	fflush(stdout);
+}
+
+void handle_sigint(int sig)
+{
+	(void)sig;
+	print_metrics();
+	exit(0);
+}
 
 cache_element* head;                //pointer to the cache
 int cache_size;             //cache_size denotes the current size of the cache
@@ -51,6 +121,18 @@ void handle_client(int socket);
 int handle_request(int clientSocket,
                    struct ParsedRequest *request,
                    char *tempReq);
+int handle_post_request(int clientSocket,
+                        struct ParsedRequest *request,
+                        char *body,
+                        int body_len);
+int handle_put_request(int clientSocket,
+                       struct ParsedRequest *request,
+                       char *body,
+                       int body_len);
+int handle_delete_request(int clientSocket,
+                          struct ParsedRequest *request,
+                          char *body,
+                          int body_len);
 int sendErrorMessage(int socket, int status_code)
 {
 	char str[1024];
@@ -59,6 +141,8 @@ int sendErrorMessage(int socket, int status_code)
 
 	struct tm data = *gmtime(&now);
 	strftime(currentTime,sizeof(currentTime),"%a, %d %b %Y %H:%M:%S %Z", &data);
+
+	metrics_inc(&errors);
 
 	switch(status_code)
 	{
@@ -230,6 +314,318 @@ int handle_request(int clientSocket, struct ParsedRequest *request, char *tempRe
 	return 0;
 }
 
+int handle_post_request(int clientSocket, struct ParsedRequest *request, char *body, int body_len)
+{
+	char *buf = (char*)malloc(sizeof(char)*MAX_BYTES);
+	strcpy(buf, "POST ");
+	strcat(buf, request->path);
+	strcat(buf, " ");
+	strcat(buf, request->version);
+	strcat(buf, "\r\n");
+
+	size_t len = strlen(buf);
+
+	if (ParsedHeader_set(request, "Connection", "close") < 0){
+		printf("set header key not work\n");
+	}
+
+	if(ParsedHeader_get(request, "Host") == NULL)
+	{
+		if(ParsedHeader_set(request, "Host", request->host) < 0){
+			printf("Set \"Host\" header key not working\n");
+		}
+	}
+
+	if (ParsedRequest_unparse_headers(request, buf + len, (size_t)MAX_BYTES - len) < 0) {
+		printf("unparse failed\n");
+	}
+
+	int server_port = 80;
+	if(request->port != NULL)
+		server_port = atoi(request->port);
+	printf("Host: %s\n", request->host);
+	printf("Port: %d\n", server_port);
+	printf("Path: %s\n", request->path);
+	int remoteSocketID = connectRemoteServer(request->host, server_port);
+
+	if(remoteSocketID < 0)
+	{
+		free(buf);
+		return -1;
+	}
+
+	// send request headers to remote server
+	int total_sent = 0;
+	int header_len = strlen(buf);
+	while(total_sent < header_len)
+	{
+		int sent = send(remoteSocketID, buf + total_sent, header_len - total_sent, 0);
+		if(sent <= 0)
+		{
+			perror("send failed");
+			free(buf);
+			close(remoteSocketID);
+			return -1;
+		}
+		total_sent += sent;
+	}
+	free(buf);
+
+	// send POST body to remote server
+	total_sent = 0;
+	while(total_sent < body_len)
+	{
+		int sent = send(remoteSocketID, body + total_sent, body_len - total_sent, 0);
+		if(sent <= 0)
+		{
+			perror("send failed");
+			close(remoteSocketID);
+			return -1;
+		}
+		total_sent += sent;
+	}
+
+	buf = (char*)malloc(sizeof(char)*MAX_BYTES);
+	bzero(buf, MAX_BYTES);
+
+	int bytes_send = recv(remoteSocketID, buf, MAX_BYTES-1, 0);
+
+	while(bytes_send > 0)
+	{
+		total_sent = 0;
+		while(total_sent < bytes_send)
+		{
+			int sent = send(clientSocket, buf + total_sent, bytes_send - total_sent, 0);
+			if(sent <= 0)
+			{
+				perror("send failed");
+				break;
+			}
+			total_sent += sent;
+		}
+
+		if(bytes_send < 0)
+		{
+			perror("Error in sending data to client socket.\n");
+			break;
+		}
+		bzero(buf, MAX_BYTES);
+		bytes_send = recv(remoteSocketID, buf, MAX_BYTES-1, 0);
+	}
+	free(buf);
+	printf("Done\n");
+	close(remoteSocketID);
+	return 0;
+}
+
+int handle_put_request(int clientSocket, struct ParsedRequest *request, char *body, int body_len)
+{
+	char *buf = (char*)malloc(sizeof(char)*MAX_BYTES);
+	strcpy(buf, "PUT ");
+	strcat(buf, request->path);
+	strcat(buf, " ");
+	strcat(buf, request->version);
+	strcat(buf, "\r\n");
+
+	size_t len = strlen(buf);
+
+	if (ParsedHeader_set(request, "Connection", "close") < 0){
+		printf("set header key not work\n");
+	}
+
+	if(ParsedHeader_get(request, "Host") == NULL)
+	{
+		if(ParsedHeader_set(request, "Host", request->host) < 0){
+			printf("Set \"Host\" header key not working\n");
+		}
+	}
+
+	if (ParsedRequest_unparse_headers(request, buf + len, (size_t)MAX_BYTES - len) < 0) {
+		printf("unparse failed\n");
+	}
+
+	int server_port = 80;
+	if(request->port != NULL)
+		server_port = atoi(request->port);
+	printf("Host: %s\n", request->host);
+	printf("Port: %d\n", server_port);
+	printf("Path: %s\n", request->path);
+	int remoteSocketID = connectRemoteServer(request->host, server_port);
+
+	if(remoteSocketID < 0)
+	{
+		free(buf);
+		return -1;
+	}
+
+	// send request headers to remote server
+	int total_sent = 0;
+	int header_len = strlen(buf);
+	while(total_sent < header_len)
+	{
+		int sent = send(remoteSocketID, buf + total_sent, header_len - total_sent, 0);
+		if(sent <= 0)
+		{
+			perror("send failed");
+			free(buf);
+			close(remoteSocketID);
+			return -1;
+		}
+		total_sent += sent;
+	}
+	free(buf);
+
+	// send PUT body to remote server
+	total_sent = 0;
+	while(total_sent < body_len)
+	{
+		int sent = send(remoteSocketID, body + total_sent, body_len - total_sent, 0);
+		if(sent <= 0)
+		{
+			perror("send failed");
+			close(remoteSocketID);
+			return -1;
+		}
+		total_sent += sent;
+	}
+
+	buf = (char*)malloc(sizeof(char)*MAX_BYTES);
+	bzero(buf, MAX_BYTES);
+
+	int bytes_send = recv(remoteSocketID, buf, MAX_BYTES-1, 0);
+
+	while(bytes_send > 0)
+	{
+		total_sent = 0;
+		while(total_sent < bytes_send)
+		{
+			int sent = send(clientSocket, buf + total_sent, bytes_send - total_sent, 0);
+			if(sent <= 0)
+			{
+				perror("send failed");
+				break;
+			}
+			total_sent += sent;
+		}
+
+		if(bytes_send < 0)
+		{
+			perror("Error in sending data to client socket.\n");
+			break;
+		}
+		bzero(buf, MAX_BYTES);
+		bytes_send = recv(remoteSocketID, buf, MAX_BYTES-1, 0);
+	}
+	free(buf);
+	printf("Done\n");
+	close(remoteSocketID);
+	return 0;
+}
+
+int handle_delete_request(int clientSocket, struct ParsedRequest *request, char *body, int body_len)
+{
+	char *buf = (char*)malloc(sizeof(char)*MAX_BYTES);
+	strcpy(buf, "DELETE ");
+	strcat(buf, request->path);
+	strcat(buf, " ");
+	strcat(buf, request->version);
+	strcat(buf, "\r\n");
+
+	size_t len = strlen(buf);
+
+	if (ParsedHeader_set(request, "Connection", "close") < 0){
+		printf("set header key not work\n");
+	}
+
+	if(ParsedHeader_get(request, "Host") == NULL)
+	{
+		if(ParsedHeader_set(request, "Host", request->host) < 0){
+			printf("Set \"Host\" header key not working\n");
+		}
+	}
+
+	if (ParsedRequest_unparse_headers(request, buf + len, (size_t)MAX_BYTES - len) < 0) {
+		printf("unparse failed\n");
+	}
+
+	int server_port = 80;
+	if(request->port != NULL)
+		server_port = atoi(request->port);
+	printf("Host: %s\n", request->host);
+	printf("Port: %d\n", server_port);
+	printf("Path: %s\n", request->path);
+	int remoteSocketID = connectRemoteServer(request->host, server_port);
+
+	if(remoteSocketID < 0)
+	{
+		free(buf);
+		return -1;
+	}
+
+	// send request headers to remote server
+	int total_sent = 0;
+	int header_len = strlen(buf);
+	while(total_sent < header_len)
+	{
+		int sent = send(remoteSocketID, buf + total_sent, header_len - total_sent, 0);
+		if(sent <= 0)
+		{
+			perror("send failed");
+			free(buf);
+			close(remoteSocketID);
+			return -1;
+		}
+		total_sent += sent;
+	}
+	free(buf);
+
+	// send DELETE body to remote server if present
+	total_sent = 0;
+	while(total_sent < body_len)
+	{
+		int sent = send(remoteSocketID, body + total_sent, body_len - total_sent, 0);
+		if(sent <= 0)
+		{
+			perror("send failed");
+			close(remoteSocketID);
+			return -1;
+		}
+		total_sent += sent;
+	}
+
+	buf = (char*)malloc(sizeof(char)*MAX_BYTES);
+	bzero(buf, MAX_BYTES);
+
+	int bytes_send = recv(remoteSocketID, buf, MAX_BYTES-1, 0);
+
+	while(bytes_send > 0)
+	{
+		total_sent = 0;
+		while(total_sent < bytes_send)
+		{
+			int sent = send(clientSocket, buf + total_sent, bytes_send - total_sent, 0);
+			if(sent <= 0)
+			{
+				perror("send failed");
+				break;
+			}
+			total_sent += sent;
+		}
+
+		if(bytes_send < 0)
+		{
+			perror("Error in sending data to client socket.\n");
+			break;
+		}
+		bzero(buf, MAX_BYTES);
+		bytes_send = recv(remoteSocketID, buf, MAX_BYTES-1, 0);
+	}
+	free(buf);
+	printf("Done\n");
+	close(remoteSocketID);
+	return 0;
+}
+
 int checkHTTPversion(char *msg)
 {
 	int version = -1;
@@ -262,6 +658,12 @@ void* worker_thread(void* arg)
 void handle_client(int socket)
 {     // Socket is socket descriptor of the connected Client
 	int bytes_send_client,len;	  // Bytes Transferred
+	struct timespec start_time, end_time;
+
+	clock_gettime(CLOCK_MONOTONIC, &start_time);
+	pthread_mutex_lock(&metrics_lock);
+	active_requests++;
+	pthread_mutex_unlock(&metrics_lock);
 
 	
 	char *buffer = (char*)calloc(MAX_BYTES,sizeof(char));	// Creating buffer of 4kb for a client
@@ -290,9 +692,30 @@ void handle_client(int socket)
 	char *tempReq = (char*)malloc(strlen(buffer)*sizeof(char)+1);
     //tempReq, buffer both store the http request sent by client
 	strcpy(tempReq, buffer);
+
+	if(bytes_send_client > 0)
+	{
+		metrics_inc(&total_requests);
+		if(strncmp(buffer, "GET ", 4) == 0)
+			metrics_inc(&get_requests);
+		else if(strncmp(buffer, "POST ", 5) == 0)
+			metrics_inc(&post_requests);
+		else if(strncmp(buffer, "PUT ", 4) == 0)
+			metrics_inc(&put_requests);
+		else if(strncmp(buffer, "DELETE ", 7) == 0)
+			metrics_inc(&delete_requests);
+	}
 	
-	//checking for the request in cache 
-	struct cache_element* temp = find(tempReq);
+	//checking for the request in cache (GET only)
+	struct cache_element* temp = NULL;
+	if(strncmp(buffer, "GET ", 4) == 0)
+	{
+		temp = find(tempReq);
+		if(temp != NULL)
+			metrics_inc(&cache_hits);
+		else
+			metrics_inc(&cache_misses);
+	}
 
 	if( temp != NULL){
         //request found in cache, so sending the response to client from proxy's cache
@@ -308,6 +731,7 @@ void handle_client(int socket)
 			if(sent <= 0){
 
 				perror("send failed");
+				metrics_inc(&errors);
 				break;
 			}
 
@@ -330,12 +754,13 @@ void handle_client(int socket)
 		if (ParsedRequest_parse(request, buffer, len) < 0) 
 		{
 		   	printf("Parsing failed\n");
+			metrics_inc(&errors);
 		}
 		else
 		{	
-			bzero(buffer, MAX_BYTES);
 			if(!strcmp(request->method,"GET"))							
 			{
+				bzero(buffer, MAX_BYTES);
                 
 				if( request->host && request->path && (checkHTTPversion(request->version) == 1) )
 				{
@@ -350,9 +775,172 @@ void handle_client(int socket)
 					sendErrorMessage(socket, 500);			// 500 Internal Error
 
 			}
+			else if(!strcmp(request->method,"POST"))
+			{
+				if( request->host && request->path && (checkHTTPversion(request->version) == 1) )
+				{
+					struct ParsedHeader *cl_header = ParsedHeader_get(request, "Content-Length");
+					if(cl_header == NULL)
+					{
+						sendErrorMessage(socket, 400);
+					}
+					else
+					{
+						char *header_end = strstr(buffer, "\r\n\r\n");
+						int header_len = (header_end - buffer) + 4;
+						int content_length = atoi(cl_header->value);
+						char *body = (char*)malloc(content_length + 1);
+						int body_len = 0;
+						int body_in_buffer = bytes_send_client - header_len;
+
+						// copy body bytes already received with the first recv()
+						if(body_in_buffer > 0)
+						{
+							memcpy(body, buffer + header_len, body_in_buffer);
+							body_len = body_in_buffer;
+						}
+
+						// recv remaining body bytes from client
+						while(body_len < content_length)
+						{
+							int n = recv(socket, body + body_len, content_length - body_len, 0);
+							if(n <= 0)
+								break;
+							body_len += n;
+						}
+
+						if(body_len < content_length)
+						{
+							free(body);
+							sendErrorMessage(socket, 400);
+						}
+						else
+						{
+							body[content_length] = '\0';
+							bytes_send_client = handle_post_request(socket, request, body, body_len);
+							free(body);
+							if(bytes_send_client == -1)
+								sendErrorMessage(socket, 500);
+						}
+					}
+				}
+				else
+					sendErrorMessage(socket, 500);
+			}
+			else if(!strcmp(request->method,"PUT"))
+			{
+				if( request->host && request->path && (checkHTTPversion(request->version) == 1) )
+				{
+					struct ParsedHeader *cl_header = ParsedHeader_get(request, "Content-Length");
+					if(cl_header == NULL)
+					{
+						sendErrorMessage(socket, 400);
+					}
+					else
+					{
+						char *header_end = strstr(buffer, "\r\n\r\n");
+						int header_len = (header_end - buffer) + 4;
+						int content_length = atoi(cl_header->value);
+						char *body = (char*)malloc(content_length + 1);
+						int body_len = 0;
+						int body_in_buffer = bytes_send_client - header_len;
+
+						// copy body bytes already received with the first recv()
+						if(body_in_buffer > 0)
+						{
+							memcpy(body, buffer + header_len, body_in_buffer);
+							body_len = body_in_buffer;
+						}
+
+						// recv remaining body bytes from client
+						while(body_len < content_length)
+						{
+							int n = recv(socket, body + body_len, content_length - body_len, 0);
+							if(n <= 0)
+								break;
+							body_len += n;
+						}
+
+						if(body_len < content_length)
+						{
+							free(body);
+							sendErrorMessage(socket, 400);
+						}
+						else
+						{
+							body[content_length] = '\0';
+							bytes_send_client = handle_put_request(socket, request, body, body_len);
+							free(body);
+							if(bytes_send_client == -1)
+								sendErrorMessage(socket, 500);
+						}
+					}
+				}
+				else
+					sendErrorMessage(socket, 500);
+			}
+			else if(!strcmp(request->method,"DELETE"))
+			{
+				if( request->host && request->path && (checkHTTPversion(request->version) == 1) )
+				{
+					struct ParsedHeader *cl_header = ParsedHeader_get(request, "Content-Length");
+					char *body = NULL;
+					int body_len = 0;
+					int body_ok = 1;
+
+					if(cl_header != NULL)
+					{
+						char *header_end = strstr(buffer, "\r\n\r\n");
+						int header_len = (header_end - buffer) + 4;
+						int content_length = atoi(cl_header->value);
+						body = (char*)malloc(content_length + 1);
+						body_len = 0;
+						int body_in_buffer = bytes_send_client - header_len;
+
+						// copy body bytes already received with the first recv()
+						if(body_in_buffer > 0)
+						{
+							memcpy(body, buffer + header_len, body_in_buffer);
+							body_len = body_in_buffer;
+						}
+
+						// recv remaining body bytes from client
+						while(body_len < content_length)
+						{
+							int n = recv(socket, body + body_len, content_length - body_len, 0);
+							if(n <= 0)
+								break;
+							body_len += n;
+						}
+
+						if(body_len < content_length)
+						{
+							free(body);
+							body = NULL;
+							body_ok = 0;
+							sendErrorMessage(socket, 400);
+						}
+						else
+						{
+							body[content_length] = '\0';
+						}
+					}
+
+					if(body_ok)
+					{
+						bytes_send_client = handle_delete_request(socket, request, body, body_len);
+						if(body != NULL)
+							free(body);
+						if(bytes_send_client == -1)
+							sendErrorMessage(socket, 500);
+					}
+				}
+				else
+					sendErrorMessage(socket, 500);
+			}
             else
             {
-                printf("This code doesn't support any method other than GET\n");
+                sendErrorMessage(socket, 501);
             }
     
 		}
@@ -364,6 +952,7 @@ void handle_client(int socket)
 	else if( bytes_send_client < 0)
 	{
 		perror("Error in receiving from client.\n");
+		metrics_inc(&errors);
 	}
 	else if(bytes_send_client == 0)
 	{
@@ -374,6 +963,16 @@ void handle_client(int socket)
 	close(socket);
 	free(buffer);
 	free(tempReq);
+
+	clock_gettime(CLOCK_MONOTONIC, &end_time);
+	double elapsed_ms = (end_time.tv_sec - start_time.tv_sec) * 1000.0
+		+ (end_time.tv_nsec - start_time.tv_nsec) / 1000000.0;
+
+	pthread_mutex_lock(&metrics_lock);
+	active_requests--;
+	completed_requests++;
+	total_processing_ms += elapsed_ms;
+	pthread_mutex_unlock(&metrics_lock);
 }
 
 
@@ -421,6 +1020,9 @@ int main(int argc, char * argv[]) {
 	struct sockaddr_in server_addr, client_addr; // Address of client and server to be assigned
  // Initializing seamaphore and lock
     pthread_mutex_init(&lock,NULL); // Initializing lock for cache
+    pthread_mutex_init(&metrics_lock,NULL);
+    signal(SIGINT, handle_sigint);
+    signal(SIGTERM, handle_sigint);
     
 
 	if(argc == 2)        //checking whether two arguments are received or not

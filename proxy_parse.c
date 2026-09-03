@@ -397,8 +397,9 @@ ParsedRequest_parse(struct ParsedRequest * parse, const char *buf,
 	  parse->buf = NULL;
 	  return -1;
      }
-     if (strcmp (parse->method, "GET")) {
-	  debug( "invalid request line, method not 'GET': %s\n", 
+     if (strcmp (parse->method, "GET") && strcmp(parse->method, "POST") &&
+	 strcmp(parse->method, "PUT") && strcmp(parse->method, "DELETE")) {
+	  debug( "invalid request line, method not 'GET', 'POST', 'PUT' or 'DELETE': %s\n", 
 		 parse->method);
 	  free(tmp_buf);
 	  free(parse->buf);
