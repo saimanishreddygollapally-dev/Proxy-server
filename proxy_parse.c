@@ -164,36 +164,55 @@ size_t ParsedHeader_headersLen(struct ParsedRequest *pr)
      return len;
 }
 
-int ParsedHeader_printHeaders(struct ParsedRequest * pr, char * buf, 
-			      size_t len)
-{
-     char * current = buf;
-     struct ParsedHeader * ph;
-     size_t i = 0;
 
-     if(len < ParsedHeader_headersLen(pr))
-     {
-	  debug("buffer for printing headers too small\n");
-	  return -1;
-     }
-  
-     while(pr->headersused > i)
-     {
-	  ph = pr->headers+i;
-	  if (ph->key) {
-	       memcpy(current, ph->key, strlen(ph->key));
-	       memcpy(current+strlen(ph->key), ": ", 2);
-	       memcpy(current+strlen(ph->key) +2 , ph->value, 
-		      strlen(ph->value));
-	       memcpy(current+strlen(ph->key) +2+strlen(ph->value) , 
-		      "\r\n", 2);
-	       current += strlen(ph->key)+strlen(ph->value)+4;
-	  }
-	  i++;
-     }
-     memcpy(current, "\r\n",2);
-     return 0;
+int ParsedHeader_printHeaders(struct ParsedRequest *pr, char *buf,
+                              size_t len)
+{
+    if (pr == NULL || buf == NULL) {
+        return -1;
+    }
+
+    size_t required = ParsedHeader_headersLen(pr);
+
+    /* Include space for the terminating NUL byte. */
+    if (len < required + 1) {
+        debug("Buffer for printing headers too small\n");
+        return -1;
+    }
+
+    char *current = buf;
+
+    for (size_t i = 0; i < pr->headersused; i++) {
+        struct ParsedHeader *ph = &pr->headers[i];
+
+        if (ph->key == NULL || ph->value == NULL) {
+            continue;
+        }
+
+        size_t key_len = strlen(ph->key);
+        size_t value_len = strlen(ph->value);
+
+        memcpy(current, ph->key, key_len);
+        current += key_len;
+
+        memcpy(current, ": ", 2);
+        current += 2;
+
+        memcpy(current, ph->value, value_len);
+        current += value_len;
+
+        memcpy(current, "\r\n", 2);
+        current += 2;
+    }
+
+    memcpy(current, "\r\n", 2);
+    current += 2;
+
+    *current = '\0';
+
+    return 0;
 }
+
 
 
 void ParsedHeader_destroyOne(struct ParsedHeader * ph)

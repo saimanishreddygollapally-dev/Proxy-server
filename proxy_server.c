@@ -17,6 +17,8 @@
 #include <time.h>
 #include <signal.h>
 
+#include <stdint.h>
+
 #define MAX_BYTES 4096    //max allowed size of request/response
 #define MAX_SIZE 200*(1<<20)     //size of the cache
 #define MAX_ELEMENT_SIZE 10*(1<<20)     //max size of an element in cache
@@ -210,7 +212,16 @@ int connectRemoteServer(char* host_addr, int port_num)
 	server_addr.sin_family = AF_INET;
 	server_addr.sin_port = htons(port_num);
 
-	bcopy((char *)host->h_addr,(char *)&server_addr.sin_addr.s_addr,host->h_length);
+	if (host == NULL || host->h_addr_list == NULL ||
+    host->h_addr_list[0] == NULL ||
+    host->h_length != sizeof(server_addr.sin_addr)) {
+    fprintf(stderr, "Hostname resolution failed or returned an invalid address\n");
+    close(remoteSocket);
+    return -1;
+}
+
+memcpy(&server_addr.sin_addr, host->h_addr_list[0],
+       sizeof(server_addr.sin_addr));
 	
 	// Connect to Remote server ----------------------------------------------------
 
@@ -224,94 +235,178 @@ int connectRemoteServer(char* host_addr, int port_num)
 }
 
 
+
 int handle_request(int clientSocket, struct ParsedRequest *request, char *tempReq)
 {
-	char *buf = (char*)malloc(sizeof(char)*MAX_BYTES);
-	strcpy(buf, "GET ");
-	strcat(buf, request->path);
-	strcat(buf, " ");
-	strcat(buf, request->version);
-	strcat(buf, "\r\n");
+    size_t capacity = MAX_BYTES;
+    char *buf = calloc(capacity, 1);
 
-	size_t len = strlen(buf);
+    if (buf == NULL) {
+        perror("calloc buf");
+        return -1;
+    }
 
-	if (ParsedHeader_set(request, "Connection", "close") < 0){
-		printf("set header key not work\n");
-	}
+    int n = snprintf(buf, capacity, "GET %s %s\r\n",
+                     request->path, request->version);
 
-	if(ParsedHeader_get(request, "Host") == NULL)
-	{
-		if(ParsedHeader_set(request, "Host", request->host) < 0){
-			printf("Set \"Host\" header key not working\n");
-		}
-	}
+    if (n < 0 || (size_t)n >= capacity) {
+        fprintf(stderr, "Request line too large\n");
+        free(buf);
+        return -1;
+    }
 
-	if (ParsedRequest_unparse_headers(request, buf + len, (size_t)MAX_BYTES - len) < 0) {
-		printf("unparse failed\n");
-		//return -1;				// If this happens Still try to send request without header
-	}
+    size_t len = (size_t)n;
 
-	int server_port = 80;				// Default Remote Server Port
-	if(request->port != NULL)
-		server_port = atoi(request->port);
-	printf("Host: %s\n", request->host);
-	printf("Port: %d\n", server_port);
-	printf("Path: %s\n", request->path);
-	int remoteSocketID = connectRemoteServer(request->host, server_port);
+    if (ParsedHeader_set(request, "Connection", "close") < 0) {
+        fprintf(stderr, "Failed to set Connection header\n");
+        free(buf);
+        return -1;
+    }
 
-	if(remoteSocketID < 0)
-		return -1;
+    if (ParsedHeader_get(request, "Host") == NULL) {
+        if (ParsedHeader_set(request, "Host", request->host) < 0) {
+            fprintf(stderr, "Failed to set Host header\n");
+            free(buf);
+            return -1;
+        }
+    }
 
-	int bytes_send = send(remoteSocketID, buf, strlen(buf), 0);
+    if (ParsedRequest_unparse_headers(request, buf + len,
+                                      capacity - len) < 0) {
+        fprintf(stderr, "Failed to serialize request headers\n");
+        free(buf);
+        return -1;
+    }
 
-	bzero(buf, MAX_BYTES);
+    char *terminator = memchr(buf, '\0', capacity);
+    if (terminator == NULL) {
+        fprintf(stderr, "Request is not NUL-terminated\n");
+        free(buf);
+        return -1;
+    }
 
-	bytes_send = recv(remoteSocketID, buf, MAX_BYTES-1, 0);
-	char *temp_buffer = (char*)malloc(sizeof(char)*MAX_BYTES+1); //temp buffer
-	int temp_buffer_size = MAX_BYTES;
-	int temp_buffer_index = 0;
+    size_t request_len = (size_t)(terminator - buf);
 
-	while(bytes_send > 0)
-	{
-		int total_sent = 0;
-		while(total_sent < bytes_send)
-		{
-			int sent = send(clientSocket,buf + total_sent,bytes_send - total_sent,0);
-			if(sent <= 0)
-			{
-				perror("send failed");
-				break;
-			}
+    int server_port = 80;
+    if (request->port != NULL)
+        server_port = atoi(request->port);
 
-			total_sent += sent;
-		}
-		for(int i=0;i<bytes_send;i++){
-			temp_buffer[temp_buffer_index] = buf[i];
-			// printf("%c",buf[i]); // Response Printing
-			temp_buffer_index++;
-		}
-		temp_buffer_size += MAX_BYTES;
-		temp_buffer=(char*)realloc(temp_buffer,temp_buffer_size+1);
+    printf("Host: %s\n", request->host);
+    printf("Port: %d\n", server_port);
+    printf("Path: %s\n", request->path);
 
-		if(bytes_send < 0)
-		{
-			perror("Error in sending data to client socket.\n");
-			break;
-		}
-		bzero(buf, MAX_BYTES);
+    int remoteSocketID = connectRemoteServer(request->host, server_port);
 
-		bytes_send = recv(remoteSocketID, buf, MAX_BYTES-1, 0);
+    if (remoteSocketID < 0) {
+        free(buf);
+        return -1;
+    }
 
-	} 
-	temp_buffer[temp_buffer_index]='\0';
-	free(buf);
-	add_cache_element(temp_buffer,  temp_buffer_index, tempReq);
-	printf("Done\n");
-	free(temp_buffer);
-	
-	
- 	close(remoteSocketID);
-	return 0;
+    size_t total_sent = 0;
+    while (total_sent < request_len) {
+        ssize_t sent = send(remoteSocketID, buf + total_sent,
+                            request_len - total_sent, 0);
+
+        if (sent <= 0) {
+            perror("send upstream request");
+            close(remoteSocketID);
+            free(buf);
+            return -1;
+        }
+
+        total_sent += (size_t)sent;
+    }
+
+    char *temp_buffer = malloc(capacity + 1);
+    if (temp_buffer == NULL) {
+        perror("malloc temp_buffer");
+        close(remoteSocketID);
+        free(buf);
+        return -1;
+    }
+
+    size_t temp_buffer_size = capacity + 1;
+    size_t temp_buffer_index = 0;
+    ssize_t bytes_send;
+
+    while ((bytes_send = recv(remoteSocketID, buf,
+                              capacity, 0)) > 0) {
+        size_t total_client_sent = 0;
+
+        while (total_client_sent < (size_t)bytes_send) {
+            ssize_t sent = send(
+                clientSocket,
+                buf + total_client_sent,
+                (size_t)bytes_send - total_client_sent,
+                0
+            );
+
+            if (sent <= 0) {
+                perror("send response to client");
+                free(temp_buffer);
+                close(remoteSocketID);
+                free(buf);
+                return -1;
+            }
+
+            total_client_sent += (size_t)sent;
+        }
+
+        size_t required =
+            temp_buffer_index + (size_t)bytes_send + 1;
+
+        if (required > temp_buffer_size) {
+            size_t new_size = temp_buffer_size;
+
+            while (new_size < required) {
+                if (new_size > SIZE_MAX / 2) {
+                    fprintf(stderr, "Response too large to cache\n");
+                    free(temp_buffer);
+                    close(remoteSocketID);
+                    free(buf);
+                    return -1;
+                }
+                new_size *= 2;
+            }
+
+            char *new_buffer = realloc(temp_buffer, new_size);
+            if (new_buffer == NULL) {
+                perror("realloc temp_buffer");
+                free(temp_buffer);
+                close(remoteSocketID);
+                free(buf);
+                return -1;
+            }
+
+            temp_buffer = new_buffer;
+            temp_buffer_size = new_size;
+        }
+
+        memcpy(temp_buffer + temp_buffer_index,
+               buf, (size_t)bytes_send);
+
+        temp_buffer_index += (size_t)bytes_send;
+    }
+
+    if (bytes_send < 0) {
+        perror("recv from upstream server");
+        free(temp_buffer);
+        close(remoteSocketID);
+        free(buf);
+        return -1;
+    }
+
+    temp_buffer[temp_buffer_index] = '\0';
+
+    close(remoteSocketID);
+    free(buf);
+
+    add_cache_element(temp_buffer, temp_buffer_index, tempReq);
+
+    free(temp_buffer);
+    printf("Done\n");
+
+    return 0;
 }
 
 int handle_post_request(int clientSocket, struct ParsedRequest *request, char *body, int body_len)
@@ -706,41 +801,68 @@ void handle_client(int socket)
 			metrics_inc(&delete_requests);
 	}
 	
-	//checking for the request in cache (GET only)
-	struct cache_element* temp = NULL;
-	if(strncmp(buffer, "GET ", 4) == 0)
-	{
-		temp = find(tempReq);
-		if(temp != NULL)
-			metrics_inc(&cache_hits);
-		else
-			metrics_inc(&cache_misses);
-	}
+	
+    // Check the cache for GET requests.
+    char *cached_response = NULL;
+    size_t cached_response_len = 0;
+    int cache_hit = 0;
 
-	if( temp != NULL){
-        //request found in cache, so sending the response to client from proxy's cache
-		int size=temp->len/sizeof(char);
-		int pos=0;
-		while(pos < size) {
-		int chunk = (size - pos > MAX_BYTES) ? MAX_BYTES : (size - pos);
+    if (strncmp(buffer, "GET ", 4) == 0) {
+        pthread_mutex_lock(&lock);
 
-		int sent_total = 0;
-		while(sent_total < chunk){
+        cache_element *entry = head;
 
-			int sent = send(socket,temp->data + pos + sent_total,chunk - sent_total, 0);
-			if(sent <= 0){
+        while (entry != NULL) {
+            if (strcmp(entry->url, tempReq) == 0) {
+                entry->lru_time_track = time(NULL);
 
-				perror("send failed");
-				metrics_inc(&errors);
-				break;
-			}
+                cached_response_len = (size_t)entry->len;
+                cached_response = malloc(cached_response_len);
 
-			sent_total += sent;
-		}
+                if (cached_response != NULL) {
+                    memcpy(cached_response, entry->data,
+                           cached_response_len);
+                    cache_hit = 1;
+                }
 
-			pos += chunk;
-		}
-		}
+                break;
+            }
+
+            entry = entry->next;
+        }
+
+        pthread_mutex_unlock(&lock);
+
+        if (cache_hit) {
+            metrics_inc(&cache_hits);
+        } else {
+            metrics_inc(&cache_misses);
+        }
+    }
+
+    if (cache_hit) {
+        size_t pos = 0;
+
+        while (pos < cached_response_len) {
+            ssize_t sent = send(
+                socket,
+                cached_response + pos,
+                cached_response_len - pos,
+                0
+            );
+
+            if (sent <= 0) {
+                perror("send cached response");
+                metrics_inc(&errors);
+                break;
+            }
+
+            pos += (size_t)sent;
+        }
+
+        free(cached_response);
+    }
+
 	
 	
 	else if(bytes_send_client > 0)
